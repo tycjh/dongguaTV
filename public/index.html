@@ -135,7 +135,7 @@
     <script data-cfasync="false" src="libs/js/vue.global.prod.min.js"></script>
 
     <!-- 非关键脚本 (延迟加载) -->
-    <script data-cfasync="false" src="libs/js/hls.min.js" defer></script>
+    <script data-cfasync="false" src="libs/js/hls.min.js?v=1.1.5-lc1" defer></script>   <!-- ?v= 必带:/libs 有 30 天 HTTP 缓存,补丁版(AAC-LC 信令,见 _dgHlsCustomType 注释)靠换 URL 才能到达老用户浏览器 -->
     <script data-cfasync="false" src="libs/js/ad-filter.js?v=4.0" defer></script>
     <script data-cfasync="false" src="libs/js/DPlayer.min.js" defer></script>
     <script data-cfasync="false" src="libs/js/bootstrap.bundle.min.js" defer></script>
@@ -2925,6 +2925,30 @@
             text-overflow: ellipsis;
         }
 
+        /* 集名文本:普通数字集名单行居中;长名(见 .ep-grid-long)最多折两行,超出才省略——
+           旧版在 flex 容器上挂 text-overflow:ellipsis 根本不生效(ellipsis 只作用于块容器的行内内容),
+           综艺"第20260703期上纯享版"这类长名直接被硬截断,啥也看不出 */
+        .ep-btn .ep-name {
+            white-space: normal;
+            word-break: break-all;
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+            line-clamp: 2;
+            overflow: hidden;
+            line-height: 1.4;
+        }
+
+        /* 集名普遍很长的剧(多为综艺):格子加宽,字号略缩,两行能装下 ~20 字 */
+        .ep-grid.ep-grid-long {
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        }
+
+        .ep-grid.ep-grid-long .ep-btn {
+            font-size: 13px;
+            padding: 8px 8px;
+        }
+
         .ep-btn:hover {
             background: #333;
             color: #fff;
@@ -4794,10 +4818,12 @@
                             <div v-if="loadingDetail" class="text-center py-5 text-muted"><i
                                     class="fas fa-spinner fa-spin"></i>
                                 加载中...</div>
-                            <div v-else class="ep-grid">
+                            <!-- 集名普遍很长(综艺"第20260703期上纯享版"这类)时给 ep-grid-long:加宽格子+允许折两行 -->
+                            <div v-else class="ep-grid"
+                                :class="{ 'ep-grid-long': episodeList.some(e => String(e.name || '').length > 7) }">
                                 <div v-for="ep in episodeList" class="ep-btn" :class="{ active: currentUrl === ep.url }"
-                                    @click="play(ep.url)">
-                                    {{ ep.name }}
+                                    :title="ep.name" @click="play(ep.url)">
+                                    <span class="ep-name">{{ ep.name }}</span>
                                 </div>
                             </div>
                         </template>
@@ -5288,6 +5314,47 @@
         // ⚠️ 结构要点：onSuccess/super.load 不能落在任何 .catch 链里——onSuccess 内部抛错若兜底到再次 super.load，
         //    v1.1.5 的 XhrLoader 会抛 "Loader can only be used once" 且该分段永久挂起。catch 只兜 IDB 本身。
         //    另有 destroyed 守卫：IDB 异步返回时 hls 可能已 destroy 该 loader(快速切集)，迟到回调直接丢弃。
+        // 🎯 DPlayer customType.hls:接管"用什么通道播 m3u8"的决定权。
+        //   DPlayer 默认逻辑:只要 video.canPlayType('application/x-mpegURL') 非空就丢掉 hls.js、把 m3u8 直接塞给 <video> 走
+        //   【浏览器原生 HLS】。过去只有 Safari/iOS 会命中;但新版 Chrome(桌面+Android)已内置 HLS,canPlayType 返回 'maybe',
+        //   于是整站在 Chrome 上悄悄改走了原生通道——而我们的整条播放栈(离线缓存 loader、hls 错误钩子、空清单识别、
+        //   去广告 worker 链路、片头分析)全是围绕 hls.js 建的,原生通道下这些全部静默失效;更糟的是浏览器内置 HLS 对资源站
+        //   那种"贴片+正片拼接、分辨率/编码中途切换、DISCONTINUITY 满天飞"的流远不如 hls.js 皮实,遇到就直接 MediaError
+        //   停在 00:00,且没有任何 hls 事件可供换源链感知 → 用户看到的就是"所有资源站都播不了、点播放没反应、console 干净"。
+        //   这里:只要 MSE 可用且不是 Safari/iOS(那边 hls.js 反而不如原生,且原生才支持 AirPlay)就【强制 hls.js】;
+        //   其余情况保持 DPlayer 原行为(video.src 已由 DPlayer 设好,原生播放)。
+        // 🔊 音频"变低沉+失真"(2026-09 根因,实测 + 对抗核查在 Chromium 自带 ffmpeg.dll 上逐帧复现):
+        //   hls.js 1.1.5 的 getAudioConfig 在 Chrome/Edge 等非 Firefox/非 Android UA 上,把所有 AAC 的 track.codec 强写成 HE-AAC
+        //   (mp4a.40.5),ASC 写成 AOT5 且"SBR 扩展采样率=基础采样率"(2a120800)——这是 hls.js 多年的 Chrome 兼容 hack(上游 1.6 才删,PR #6627)。
+        //   真正的扳机在 DISCONTINUITY:片源每 20 片一个 DISCONTINUITY(或每 ~10-13 分钟一个广告拼接点),hls.js 的 mp4-remuxer 在非连续
+        //   分片处发现音频比视频晚 ≥1 帧就"注入静音帧"补洞(console 有 "[mp4-remuxer]: Injecting N audio frame" 警告),静音帧按
+        //   track.codec 选 → 选中 HE-AACv2 版(SCE+SBR/PS 载荷);Chromium 内置 FFmpeg 的 aacdec 收到它后把解码器锁进 sbr=1 状态,
+        //   而 ASC 里 ext==base 让它每帧合成 2048 采样却只输出前 1024 个 → 每帧内容被拉长一倍再截半:音高整体低一个八度+碎裂,
+        //   时长/同步完全不变,画面正常;seek 不会恢复,只有新建解码器(换源/刷新页面)才恢复。这是 FFmpeg 的长期行为,不是浏览器新 bug。
+        //   实测(本机 Chromium 148,captureStream 录音 vs ffmpeg 解码真值,逐秒频谱重心/基频比对):无 DISCONTINUITY 的集正常;有
+        //   DISCONTINUITY 的集频谱整体下移恰好 1 个八度(谱形相关 0.95-0.99);改成 AAC-LC 信令后跨多个 DISCONTINUITY 与真值一致。
+        //   修法在 libs/js/hls.min.js(文件顶部有 banner):getAudioConfig 只要清单没声明 HE-AAC、内容也不是隐式 HE(≤24kHz 且无 CODECS),
+        //   一律按 ADTS 实际类型走 AAC-LC 分支(ASC 1210 / mp4a.40.2,静音帧也随之变成 LC 版),与 hls.js ≥1.6 行为一致。
+        //   ⚠️ 升级/替换 hls.min.js 必须重新打补丁——`node scripts/check-hls-lc-patch.mjs` 会失败提醒。
+        //   3 月那次"修好"其实是 DPlayer 改走浏览器原生 HLS 绕开了 MSE,8 月强制回 hls.js 通道后自然回来。
+        window._dgPreferNativeHls = (() => {
+            try {
+                const ua = navigator.userAgent || '';
+                const isiOS = /iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+                const isSafari = /Safari/.test(ua) && !/Chrome|CriOS|Edg|EdgA|Android|Firefox|FxiOS|OPR|SamsungBrowser/i.test(ua);
+                return isiOS || isSafari;
+            } catch (e) { return false; }
+        })();
+        window._dgHlsCustomType = function (video, player) {
+            try {
+                if (window._dgPreferNativeHls || !window.Hls || !Hls.isSupported()) return;   // 原生通道(DPlayer 已设好 video.src)
+                const hls = new Hls((player.options && player.options.pluginOptions && player.options.pluginOptions.hls) || buildOfflineHlsConfig());
+                player.plugins.hls = hls;
+                hls.loadSource(video.src);
+                hls.attachMedia(video);
+                player.events.on('destroy', () => { try { hls.destroy(); } catch (e) { } if (player.plugins.hls === hls) delete player.plugins.hls; });
+            } catch (e) { console.warn('[播放器] hls.js 接管失败,回退浏览器原生 HLS:', e && e.message); }
+        };
         function buildOfflineHlsConfig() {
             try {
                 if (!window.Hls || !Hls.DefaultConfig || !Hls.DefaultConfig.loader) return {};
@@ -5329,7 +5396,10 @@
                     }
                     window._OfflineHlsLoader = OfflineLoader;
                 }
-                return { loader: window._OfflineHlsLoader };
+                // backBufferLength:90 —— 1.1.5 默认 Infinity 把已播部分永远留在 SourceBuffer,10 分钟上下就撞 Chrome 的 12MB 音频/
+                //   150MB 视频上限交给浏览器自己 GC;另据 hls.js #7367,Chrome/Edge 138+ 改了 QuotaExceededError 的类型,1.1.5 可能认不出来而当成
+                //   致命 bufferAppendError → 站内错误链误判换源(该点未在本机单独验证)。自己只留 90s 后向缓冲就基本走不到这条路(回拖 >90s 重拉分片即可)。
+                return { loader: window._OfflineHlsLoader, backBufferLength: 90 };
             } catch (e) { return {}; }
         }
         let _lastProgressSaveTime = 0;  // timeupdate 节流时间戳（每15秒保存一次）
@@ -5408,7 +5478,8 @@
                     pastCompactThreshold: false,  // 滚动越过 400px(用于搜索框 compact)；仅阈值翻转时更新，避免每帧重渲染
                     hotList: [],
                     sitesMap: {},  // 缓存站点信息（用于客户端测速）
-                    corsProxyUrl: null,  // CORS 代理 URL（用于中转无法直接访问的资源站 API）
+                    corsProxyUrl: null,  // CORS 代理 URL（当前主代理；用于中转无法直接访问的资源站 API）
+                    corsProxyUrls: [],   // 全部 CORS 代理（多代理冗余；过滤代理故障时轮换到备用 worker）
                     danmakuEnabled: false,  // 🗨️ 弹幕开关（来自 /api/config，配置了 DANMU_API_URL 才为 true）
                     requestsEnabled: false, // 📮 求片开关（来自 /api/config：仅 VPS/server.js 配了 ADMIN_TOKEN 才为 true；Vercel 始终 false）
                     playbackErrorCount: 0,  // 播放失败计数
@@ -6101,10 +6172,16 @@
                         }
                         TMDB_API_KEY = config.tmdb_api_key;
 
-                        // 保存 CORS 代理 URL（用于资源站 API 中转）
-                        if (config.cors_proxy_url) {
-                            this.corsProxyUrl = config.cors_proxy_url;
-                            console.log('[Config] CORS 代理已配置:', config.cors_proxy_url);
+                        // 保存 CORS 代理 URL（用于资源站 API 中转）。支持多代理:cors_proxy_urls 数组做冗余,
+                        //   corsProxyUrl 取第一个作【当前主代理】(所有既有 `${corsProxyUrl}/?url=` 照常);
+                        //   过滤代理故障时 handleError 会把 corsProxyUrl 轮换到列表里健康的备用 worker。
+                        const _proxyList = (Array.isArray(config.cors_proxy_urls) && config.cors_proxy_urls.length)
+                            ? config.cors_proxy_urls.map(u => String(u || '').trim().replace(/\/+$/, '')).filter(u => /^https?:\/\//i.test(u))
+                            : (config.cors_proxy_url ? [String(config.cors_proxy_url).trim().replace(/\/+$/, '')] : []);
+                        this.corsProxyUrls = _proxyList;
+                        if (_proxyList.length) {
+                            this.corsProxyUrl = _proxyList[0];
+                            console.log('[Config] CORS 代理已配置:', _proxyList[0] + (_proxyList.length > 1 ? ' (+' + (_proxyList.length - 1) + ' 备用)' : ''));
                         }
 
                         // 🗨️ 弹幕开关（服务端配置了 DANMU_API_URL 才开启）
@@ -7009,13 +7086,15 @@
                                 // 找到对应集数
                                 let targetEpisode = this.episodeList[0];
                                 if (item.episode) {
-                                    // 精确匹配集数名称
-                                    const found = this.episodeList.find(ep => ep.name === item.episode);
+                                    const wk = this._epMatchKey(item.episode), wc = wk.split('|')[0];
+                                    let found = this.episodeList.find(ep => ep.name === item.episode)
+                                        || this.episodeList.find(ep => this._epMatchKey(ep.name) === wk);
+                                    if (!found && wc) found = this.episodeList.find(ep => this._epMatchKey(ep.name).split('|')[0] === wc);
                                     if (found) {
                                         targetEpisode = found;
-                                        console.log('[观看历史] 找到匹配集数:', item.episode);
+                                        console.log('[观看历史] 找到匹配集数:', found.name);
                                     } else {
-                                        console.log('[观看历史] 未找到匹配集数:', item.episode, '使用第一集');
+                                        console.log('[观看历史] 该线路没有《' + item.episode + '》这一集，回退第一集');
                                     }
                                 }
 
@@ -8403,10 +8482,13 @@
                     };
 
                     // 超时自动选择（优先用户端测速，其次服务器端）
+                    // ⚠️ 死锁教训(生产事故):此定时器在 3s 时若【一个源都还没测完】(大剧 40+ 线路、首批 worker 都是慢站/
+                    //    死站时很常见),旧版无条件 hasAutoSelected=true 再发现无源可选【静默返回】——标志被烧掉后,
+                    //    checkEarlyReturn 与"测速完成"路径全部跳过,30 个测出绿灯的线路永远没人选,整站表现为"全部播放不了"。
+                    //    修:只有【真选中了源】才置 hasAutoSelected;空手时保持 false,让后续完成的测速自然接管。
                     const earlyReturnTimer = setTimeout(() => {
                         if (_openSeq !== _navSeq) return;  // 🧭 已切换到别的剧，放弃超时自动选源
                         if (hasAutoSelected) return;
-                        hasAutoSelected = true;
 
                         // 优先选择用户端测速的结果
                         let directSources = this.currentGroup.sources.filter(s =>
@@ -8414,6 +8496,7 @@
                         );
 
                         if (directSources.length > 0) {
+                            hasAutoSelected = true;
                             directSources.sort((a, b) => a.latency - b.latency);
                             console.log(`[超时返回] 选择用户端测速最快的: ${directSources[0].site_name} (${directSources[0].latency}ms 🎬)`);
                             this.switchSource(directSources[0]);
@@ -8426,6 +8509,7 @@
                             s._testType === 'proxy' && typeof s.latency === 'number' && s.latency < 9000
                         );
                         if (proxySources.length > 0) {
+                            hasAutoSelected = true;
                             proxySources.sort((a, b) => a.latency - b.latency);
                             console.log(`[超时返回] 选择代理可播最快的: ${proxySources[0].site_name} (${proxySources[0].latency}ms 🔁)`);
                             this.switchSource(proxySources[0]);
@@ -8438,10 +8522,12 @@
                         );
 
                         if (testedSources.length > 0) {
+                            hasAutoSelected = true;
                             testedSources.sort((a, b) => a.latency - b.latency);
                             console.log(`[超时返回] ${MAX_WAIT_TIME}ms后自动选择: ${testedSources[0].site_name} (${testedSources[0].latency}ms)`);
                             this.switchSource(testedSources[0]);
                         }
+                        // 一个都没测完 → 不烧标志,等 checkEarlyReturn/测速完成路径接管
                     }, MAX_WAIT_TIME);
 
                     const latencyWorker = async (source) => {
@@ -8513,10 +8599,17 @@
 
                                 clearTimeout(timeoutId);
 
-                                if (testRes.ok || testRes.type === 'cors') {
-                                    directLatency = Date.now() - startTime;
-                                    source.latency = directLatency;
-                                    directSuccess = true;
+                                // ⚠️ 旧版把 testRes.type==='cors' 也算成功——但带 CORS 头的 403/404 错误页 type 同样是 'cors',
+                                //    .ok=false 却被判"可达",于是死站测出延迟显绿灯、点进去播不了(用户实测的核心症状之一)。
+                                //    改为只认真正 2xx(.ok);顺带轻量校验响应体确实是 m3u8(#EXTM3U),挡掉返回 200 却是 HTML/错误页的源。
+                                if (testRes.ok) {
+                                    let bodyOK = true;
+                                    try { const txt = await testRes.clone().text(); bodyOK = await this._m3u8HasFragments(txt, videoUrl); } catch (e) { bodyOK = true; }
+                                    if (bodyOK) {
+                                        directLatency = Date.now() - startTime;
+                                        source.latency = directLatency;
+                                        directSuccess = true;
+                                    }
                                 }
                             } catch (directError) {
                                 // 直接访问失败，稍后尝试代理
@@ -8541,7 +8634,9 @@
 
                                     clearTimeout(proxyTimeoutId);
 
-                                    if (proxyTestRes.ok) {
+                                    let proxyBodyOK = proxyTestRes.ok;
+                                    if (proxyTestRes.ok) { try { const ptxt = await proxyTestRes.clone().text(); proxyBodyOK = await this._m3u8HasFragments(ptxt, proxyUrl); } catch (e) { proxyBodyOK = true; } }
+                                    if (proxyBodyOK) {
                                         const proxyLatency = Date.now() - proxyStartTime;
 
                                         // 如果直连失败，使用代理
@@ -8668,7 +8763,8 @@
                     }
 
                     // 如果还没有选择任何源，选择最快的
-                    if (!hasAutoSelected) {
+                    // (兜底条件含 !this.currentSource:任何路径把 hasAutoSelected 烧掉却没真选到源,这里都要接住——防再现"测出绿灯没人选"死锁)
+                    if (!hasAutoSelected || !this.currentSource) {
                         // 优先选择用户端测速(direct)的结果
                         const directSources = this.currentGroup.sources.filter(s =>
                             s._testType === 'direct' && typeof s.latency === 'number' && s.latency < 9000
@@ -9095,6 +9191,44 @@
                     }
                 },
 
+                // 🔑 集名归一化匹配键。各资源站对【同一集】的命名千差万别(实测同一期综艺:
+                //    "第20260809期加更"(ikun) / "20260809加更"(dyttzy) / "20260809下"(1080资源)),
+                //    旧逻辑只归一化"第N集"、其余要求【原名完全相等】→ 换源时几乎必然匹配失败 →
+                //    回退"使用第一集",而第一集往往是先导片/预告甚至空清单 → 表现为"换了源还是播不了"。
+                //    这里按 日期式期号 或 集号 提取主键,再附上"部分"后缀(上/下/加更/纯享…不能混为一集)。
+                _epMatchKey(name) {
+                    const s = String(name || '').trim();
+                    if (!s) return '';
+                    let core = null;
+                    const d = s.match(/(?:^|\D)((?:19|20)\d{2})[-./]?(\d{2})[-./]?(\d{2})(?=\D|$)/);
+                    if (d && +d[2] >= 1 && +d[2] <= 12 && +d[3] >= 1 && +d[3] <= 31) core = d[1] + d[2] + d[3];
+                    if (!core) {
+                        const n = s.match(/第\s*0*(\d+)\s*[集话話期]/) || s.match(/(?:^|[^a-z0-9])ep\.?\s*0*(\d+)/i) || s.match(/^0*(\d+)$/);
+                        if (n) core = 'N' + parseInt(n[1], 10);
+                    }
+                    if (!core) return 'T' + s.toLowerCase().replace(/\s+/g, '');   // 无结构集名 → 原名归一
+                    let suf = '';
+                    const rest = s.replace(/(?:19|20)?\d{2,8}/g, '');
+                    const re = /(上|中|下|加更|纯享|先导|特辑|彩蛋|花絮|预告|回顾|集结篇|plus)/g;
+                    let m2; while ((m2 = re.exec(rest))) suf += m2[1];
+                    return core + '|' + suf.toLowerCase();
+                },
+                // ❓该线路【是否确实有这一集】。换源前先问清楚,而不是切过去再靠匹配碰运气——
+                //    切过去才发现没有就会回退播第一集(先导片/预告/甚至空清单),正是"换了源还是播不了"的根源。
+                //    数据来自测速阶段已缓存的 _cachedDetail.vod_play_url,不额外发任何请求。
+                //    返回 true=有 / false=确实没有 / null=该源详情还没缓存(未知,不作否定判断)。
+                _sourceHasEpisode(source, epName) {
+                    if (!epName) return true;
+                    const pu = (source && source._cachedDetail && source._cachedDetail.vod_play_url) || (source && source.vod_play_url) || '';
+                    if (!pu) return null;
+                    let seg = pu;
+                    if (pu.includes('$$$')) { const sets = pu.split('$$$'); seg = sets.find(x => x.toLowerCase().includes('m3u8')) || sets[0]; }
+                    const want = this._epMatchKey(epName), core = want.split('|')[0];
+                    const names = seg.split('#').map(e => e.split('$')[0]);
+                    if (names.some(n => this._epMatchKey(n) === want)) return true;
+                    if (core && names.some(n => this._epMatchKey(n).split('|')[0] === core)) return true;
+                    return false;
+                },
                 // 解析剧集列表，尝试匹配指定集数
                 parseEpisodes(urlStr, targetEpName) {
                     let playSource = urlStr;
@@ -9111,16 +9245,18 @@
                         // 尝试找到与之前相同名称的集数
                         let targetEp = this.episodeList[0];
                         if (targetEpName) {
-                            // 标准化集数名称进行匹配
-                            const normalize = (name) => name?.replace(/第0*(\d+)集/g, '第$1集') || '';
-                            const normalizedTarget = normalize(targetEpName);
-
-                            const found = this.episodeList.find(ep => normalize(ep.name) === normalizedTarget);
+                            const wantKey = this._epMatchKey(targetEpName);
+                            const wantCore = wantKey.split('|')[0];
+                            // ①原名全等 ②归一化键全等(跨源写法差异) ③同期号/同日期但"部分"不同(退而求其次,总比第一集强)
+                            let found = this.episodeList.find(ep => ep.name === targetEpName)
+                                || this.episodeList.find(ep => this._epMatchKey(ep.name) === wantKey);
+                            let loose = false;
+                            if (!found && wantCore) { found = this.episodeList.find(ep => this._epMatchKey(ep.name).split('|')[0] === wantCore); loose = !!found; }
                             if (found) {
                                 targetEp = found;
-                                console.log('[切换资源] 找到匹配集数:', targetEp.name);
+                                console.log('[切换资源] 找到匹配集数:', targetEp.name + (loose ? '(同期近似匹配)' : ''));
                             } else {
-                                console.log('[切换资源] 未找到匹配集数:', targetEpName, '使用第一集');
+                                console.log('[切换资源] 该线路没有《' + targetEpName + '》这一集，回退第一集:', targetEp.name);
                             }
                         }
                         this.play(targetEp.url);
@@ -9309,13 +9445,34 @@
                         } else if (el) { el.remove(); }
                     } catch (e) { }
                 },
+                // ✅ m3u8 是否【真的有可播分片】。只验 #EXTM3U 远远不够:master playlist 自身永远没有 EXTINF,
+                //    而"零分片的空清单"(#EXTM3U…#EXT-X-ENDLIST 中间无 EXTINF)语法完全合法却一秒都播不了——
+                //    实测有资源站正是这样,测速判"可用"、选中后播放器静默停在 00:00 且不报错(不报错=不会自动换源)。
+                //    规则:媒体清单直接看有无 EXTINF;master 清单跟进【第一条】子清单再看一次(只多一跳,代价可接受)。
+                async _m3u8HasFragments(text, baseUrl) {
+                    try {
+                        if (!/#EXTM3U/.test(text)) return false;
+                        if (/#EXTINF/.test(text)) return true;
+                        if (!/#EXT-X-STREAM-INF/i.test(text)) return false;   // 既非 master 又无分片 = 空清单
+                        const line = text.split(String.fromCharCode(10)).map(x => x.trim()).find(x => x && x[0] !== '#');
+                        if (!line) return false;
+                        const sub = new URL(line, baseUrl).href;
+                        const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
+                        const r = await fetch(sub, { cache: 'no-store', signal: ctl.signal });
+                        clearTimeout(t);
+                        if (!r.ok) return false;
+                        return /#EXTINF/.test(await r.text());
+                    } catch (e) { return true; }   // 网络/CORS 抖动不冤枉源站,交给播放侧的零分片闸兜底
+                },
                 // 🗄️ 资源站健康度本地缓存(跨剧集, 3天)：site_key → {latency,testType,useProxy,proxyUrl,ts}。
                 //    本地连不通的资源站基本不会再通，缓存上次测速结果 → 刷新页面/?play= 深链/换剧都直接套用、跳过重测；
                 //    本地不通的站(latency 高)自然沉底/视为不可用，省去重复测速。手动"刷新线路"会强制重测并刷新本缓存。
+                //    键 v2:"/api/check 全站误判9999+选源死锁"事故期间用户缓存里灌满了 12h 死亡记录,换键整体作废。
                 _siteHealthGet(siteKey) {
                     if (!siteKey) return null;
+                    try { localStorage.removeItem('donggua_site_health'); } catch (e) { }
                     try {
-                        const m = JSON.parse(localStorage.getItem('donggua_site_health') || '{}') || {};
+                        const m = JSON.parse(localStorage.getItem('donggua_site_health2') || '{}') || {};
                         const r = m[siteKey];
                         if (r && typeof r.latency === 'number') {
                             // 不可用项(9999)缓存短(12h)便于恢复；测通的(direct/proxy)缓存 3 天免重测
@@ -9339,10 +9496,33 @@
                     if (!isGood && !(isDead && allowDead)) return;
                     try {
                         const MAXTTL = 3 * 24 * 3600 * 1000, now = Date.now();
-                        const m = JSON.parse(localStorage.getItem('donggua_site_health') || '{}') || {};
+                        const m = JSON.parse(localStorage.getItem('donggua_site_health2') || '{}') || {};
                         m[siteKey] = { latency: source.latency, testType: tt || null, useProxy: !!source._useProxy, proxyUrl: source._proxyUrl || null, ts: now };
                         for (const k of Object.keys(m)) { if (now - (m[k].ts || 0) > MAXTTL) delete m[k]; }  // 剪枝过期
-                        localStorage.setItem('donggua_site_health', JSON.stringify(m));
+                        localStorage.setItem('donggua_site_health2', JSON.stringify(m));
+                    } catch (e) { }
+                },
+                // 🛡️ "该站的源站封了 Cloudflare 出口 IP"记账。只在【确诊源站封 CF】(worker 探测本集 m3u8 返回 403/404)
+                //    时才记 —— 绝不因 worker 自身 5xx/超时(临时故障)而记,否则 worker 一次抽风就把好站误关小黑屋、广告全回来。
+                //    TTL 只 12h(误记也能半天自愈;真封 CF 的站半天重探一次成本极低)。键名带 v2:老版本的错误记账一律作废。
+                //    ⚠️ v1(donggua_adproxy_bad)因分诊过激会误记好站,已弃用,不再读取。
+                _adProxyBad(siteKey) {
+                    if (!siteKey) return false;
+                    if (this._adProxyBadSites && this._adProxyBadSites[siteKey]) return true;
+                    try {
+                        const m = JSON.parse(localStorage.getItem('donggua_adproxy_bad2') || '{}');
+                        return !!(m[siteKey] && Date.now() - m[siteKey] < 12 * 3600 * 1000);
+                    } catch (e) { return false; }
+                },
+                _adProxyBadMark(siteKey) {
+                    if (!siteKey) return;
+                    (this._adProxyBadSites = this._adProxyBadSites || {})[siteKey] = 1;
+                    try {
+                        const m = JSON.parse(localStorage.getItem('donggua_adproxy_bad2') || '{}');
+                        m[siteKey] = Date.now();
+                        const ks = Object.keys(m);
+                        if (ks.length > 60) ks.sort((a, b) => m[a] - m[b]).slice(0, ks.length - 60).forEach(k => delete m[k]);
+                        localStorage.setItem('donggua_adproxy_bad2', JSON.stringify(m));
                     } catch (e) { }
                 },
                 play(url) {
@@ -9392,7 +9572,39 @@
                     this.currentUrl = url;
                     this.playbackErrorCount = 0;  // 重置错误计数
                     this._proxyRetried = false;    // 重置代理重试标记
+                    // 🚨 必须一并重置 _proxyRetrying —— 它是【实例级"正在代理回退中,吞掉所有错误"】的闸门,
+                    //   旧代码只在 switchTo 的 8s 定时器/分诊分支里清,却【从不在 play() 时清】。于是:
+                    //   源A 报错 → 闸门开(8s) → auto-failover 每 1.5s 切一个源 → 这 8s 内【后续每个源的错误
+                    //   全被静默吞掉】(日志表现:每次 play() 后紧跟"⏳ 代理回退中,忽略错误",且全程无一条分诊输出)
+                    //   → 谁都没机会走分诊/换源/看门狗 → 播放器永久停在 00:00、点播放毫无反应、console 一片空白。
+                    //   每次 play() 都是全新一次播放,必须从零开始,不能继承上一个源的闸门状态。
+                    this._proxyRetrying = false;
+                    try { clearTimeout(this._proxyRetryGuard); } catch (e) { }
                     const playSeq = _navSeq;       // 🧭 记录本次播放的导航上下文（供错误回退判断串剧）
+                    // 🎟️ 播放令牌:每次 play() 都递增(切源/换集/换剧都变)。playSeq 只在【换剧】时变,同一部剧内切源恒等,
+                    //    因此绝不能用它给"本次播放"的异步回调(看门狗/重试)做边界——那会让上一个源装的定时器对下一个源生效。
+                    const playToken = (this._playToken = (this._playToken || 0) + 1);
+                    try { if (window.afpOffline) window.afpOffline._abort = true; } catch (e) { }   // 🚦 换源/换集:先叫停上一轮后台分析,别让它继续抢新源的带宽
+                    // ⏱️ 起播看门狗(不依赖任何 hls 事件的最后一道闸)。
+                    //   实测有死源(空清单/极小清单)会让 hls.js 【完全静默】:不触发 LEVEL_LOADED、不触发 FRAG_LOADED、
+                    //   连 ERROR 都不报(量子/如意资源即如此) → 播放器永远停在 00:00、点播放毫无反应、console 一片干净,
+                    //   而所有"靠错误事件驱动"的自动换源链(handleError/Auto-Failover/代理回退)统统不会被唤醒,
+                    //   于是明明有可播线路(ffzy/魔都实测 959/1917 分片正常)也永远轮不到 —— 表现为"所有资源站都播不了"。
+                    //   这里用纯超时兜底:起播 14s 内没有任何实质进展(readyState<3 且 0 进度 且 无缓冲)就判该源不可播、自动换源。
+                    try { clearTimeout(this._startWatchdog); } catch (e) { }
+                    this._startWatchdog = setTimeout(() => {
+                        if (this._playToken !== playToken) return;   // 已换源/换集 → 本看门狗作废
+                        try {
+                            const v = (typeof dp !== 'undefined' && dp && dp.video) ? dp.video : null;
+                            if (!v) return;
+                            const hasContent = !v.error && (v.readyState >= 3 || (v.currentTime || 0) > 0.1 || (v.buffered && v.buffered.length > 0));   // 已进 error 态=死透,缓冲过也不算
+                            if (hasContent) return;
+                            console.warn('[播放器] ⏱️ 起播超时:14s 内无任何分片就绪(该线路可能返回空清单/静默挂起) → 自动换源');
+                            try { dp.notice('该线路无有效内容，正在换源', 2500); } catch (e) { }
+                            if (typeof window._offHandlePlayError === 'function') window._offHandlePlayError('startTimeout');
+                            else this.handlePlaybackError();
+                        } catch (e) { }
+                    }, 14000);
                     const isFreshPlayer = !dp;     // ▶ 是否新建播放器（决定如何触发首次播放）
                     this.syncShareUrl();           // 🔗 把当前剧/集写进地址栏（可收藏/分享/深链）
 
@@ -9429,10 +9641,10 @@
                     // 📦 已缓存的集也不套(_offCacheRec):缓存的就是净化版,包一层只会让缓存键错位
                     const isDirectM3U8 = url && url.includes('.m3u8') && !(this.currentSource && this.currentSource._useProxy) && !this._liveActive && !_offCacheRec;
                     if (window.AdFilter && window.AdFilter.isEnabled() && isDirectM3U8 && this.corsProxyUrl) {
-                        // 本会话已确认"过滤代理过不了"的线路(源站封代理IP/URL签名绑IP)不再反复试代理:
-                        // 直连能看但没有过滤——想要无广告请换线路(错误分诊时已自动换过)
-                        if (this._adProxyBadSites && this.currentSource && this._adProxyBadSites[this.currentSource.site_key]) {
-                            console.log('[播放器] 🛡️ 本线路(' + this.currentSource.site_key + ')此前过滤代理失败(源站封代理)，本集直连播放——广告过滤对该线路不可用，换其它线路可恢复过滤');
+                        // 已确认"过滤代理过不了"的线路(源站封代理IP/URL签名绑IP,3天记账)不再反复试代理:
+                        // 直连能看但没有过滤——想要无广告请换线路
+                        if (this.currentSource && this._adProxyBad(this.currentSource.site_key)) {
+                            console.log('[播放器] 🛡️ 本线路(' + this.currentSource.site_key + ')的源站屏蔽过滤代理(3天内记账)，本集直连播放——广告过滤对该线路不可用，换其它线路可恢复过滤');
                         } else {
                             finalUrl = this.corsProxyUrl + '/?url=' + encodeURIComponent(finalUrl);
                             adFilterProxyUsed = true;
@@ -9455,6 +9667,29 @@
                     const setupErrorHandling = () => {
                         // 统一错误处理函数（dp.error 和 video.error 都会触发）
                         const handleError = (source) => {
+                            // 🎟️ 本处理器只在首次建播放器时绑定一次,闭包里 play() 局部的 playToken 永远冻结成"首个播放"的令牌
+                            //   (与上方 playSeq/originalUrl 冻结是同一个坑)。v1.1.175 在下面的分诊/看门狗里用它判
+                            //   `this._playToken !== playToken` → 从第二次 play() 起恒为 true → 分诊拿到探测结果后【静默返回】、
+                            //   8s 看门狗【静默作废】——于是出错后既不重试也不换源,只剩一行"代理回退中,忽略错误"。
+                            //   必须在每次错误到来时读【当前】令牌(用同名 const 遮蔽外层冻结值,下面所有引用自动生效)。
+                            const playToken = this._playToken;
+                            // 🩺 每次播放的首个错误打一行诊断(MediaError 码/信息、就绪态、播放通道是 hls.js 还是浏览器原生 HLS)——
+                            //   没有它,"播不了"永远只能靠猜。
+                            try {
+                                if (this._errDiagTok !== playToken) {
+                                    this._errDiagTok = playToken;
+                                    const v = (typeof dp !== 'undefined' && dp && dp.video) ? dp.video : null;
+                                    const me = v && v.error;
+                                    console.warn('[播放器] 🩺 错误诊断(' + source + '): code=' + (me ? me.code : '-') + ' msg=' + (me && me.message ? me.message.slice(0, 120) : '-')
+                                        + ' | readyState=' + (v ? v.readyState : '-') + ' networkState=' + (v ? v.networkState : '-') + ' t=' + (v ? (v.currentTime || 0).toFixed(1) : '-')
+                                        + ' | 通道=' + ((dp && dp.plugins && dp.plugins.hls) ? 'hls.js' : ('原生HLS(dp.type=' + (dp && dp.type) + ')'))
+                                        + ' src=' + (v ? String(v.currentSrc || v.src || '').slice(0, 60) : '-')
+                                        + ' | MSE=' + !!(window.Hls && Hls.isSupported()) + ' nativeHls=' + JSON.stringify(v ? v.canPlayType('application/vnd.apple.mpegURL') : '')
+                                        + ' online=' + navigator.onLine);
+                                }
+                            } catch (e) { }
+                            // 🚦 播放一出错就叫停后台离线分析——它正在下几十MB分片抢带宽,是这类"播不了"的常见推手
+                            try { if (window.afpOffline) window.afpOffline._abort = true; } catch (e) { }
                             // 🧭 用户已切换到别的剧（_navSeq 变化且 this._activePlaySeq 未被新 play() 刷新到）→ 忽略旧错误
                             if (this._activePlaySeq !== _navSeq) {
                                 console.log('[播放器] ⏭️ 忽略旧剧残留的错误事件 (' + source + ')');
@@ -9465,40 +9700,32 @@
                                 console.log('[播放器] ⏳ 代理回退中，忽略错误 (' + source + ')');
                                 return;
                             }
-                            // 如果使用了广告过滤代理，先分诊再决定回退方式——
-                            //   旧行为"一失败就回退直连"会静默放弃过滤,用户看到满屏广告还以为过滤坏了。
-                            //   分诊:worker 有任何 HTTP 响应(哪怕4xx/5xx)=代理活着 → 是【本线路】过不了(源站封代理IP/URL签名绑IP),
-                            //        换下一条线路继续保广告过滤;worker 不通/超时 或 已有≥2条线路代理失败(疑似代理全局故障/配额耗尽)
-                            //        或没有下一条线路 → 回退直连兜底(能看优先,明确提示可能含广告)。
+                            // 广告过滤代理失败时:先【把本集 m3u8 通过 worker 再取一次、按返回状态精确分诊】,再决定回退方式。
+                            //   worker 会加 CORS 头 → 这次探测能读到真实 status/body,足以区分三种情况:
+                            //   ① worker 5xx/429/超时/网络失败 = 过滤代理【自身临时故障】(如 CF 503/配额波动) → 本集直连兜底,
+                            //      【绝不记账、不换线路】,下次播放自动重试过滤(修:旧版把 worker 一次 503 误判成"源站封CF"并记3天,
+                            //      导致常用站广告全回来——正是本次 bug);
+                            //   ② worker 返回 403/404/451 或 200 但非 m3u8 = 源站真封 CF 出口 → 记账(12h);直连可达就原站直连,
+                            //      否则(proxy-only)换线路保过滤;
+                            //   ③ worker 返回 200 且是 #EXTM3U = 过滤代理其实正常,原错误是偶发 → 重试走过滤代理(不记账不换线)。
                             if (this._activeAdFilterProxyUsed && !this._proxyRetried) {
                                 this._proxyRetried = true;
                                 this._proxyRetrying = true;
-                                const fb = this._activeOriginalUrl;
+                                // 🔐 死亡开关:分诊链路一旦有未预料的异常/提前返回,闸门就会永久锁死整场会话。
+                                //    无论如何 10s 后强制解闸,让后续错误能正常触发换源。
+                                try { clearTimeout(this._proxyRetryGuard); } catch (e) { }
+                                this._proxyRetryGuard = setTimeout(() => {
+                                    if (this._proxyRetrying) { console.warn('[播放器] ⏱️ 代理回退闸门超时未关闭,强制解除(防止吞掉后续所有错误)'); this._proxyRetrying = false; }
+                                }, 10000);
+                                const fb = this._activeOriginalUrl;                 // 未包装的原始 m3u8(直连回退用)
+                                const wrapped = this._activeFinalUrl;               // 过滤代理(worker)包装后的 m3u8
                                 const failSite = this.currentSource && this.currentSource.site_key;
-                                const srcs = this.availableSources || [];
-                                const idx = srcs.findIndex(s => s.site_key === failSite);
-                                const canHop = idx >= 0 && idx < srcs.length - 1 && Object.keys(this._adProxyBadSites || {}).length < 2;
-                                const probe = !canHop ? Promise.resolve(false) : (async () => {
-                                    try {
-                                        const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 2500);
-                                        await fetch(this.corsProxyUrl, { mode: 'no-cors', cache: 'no-store', signal: ctl.signal });   // no-cors:只探"通不通",不要求 CORS 头
-                                        clearTimeout(t); return true;
-                                    } catch (e) { return false; }
-                                })();
-                                probe.then(workerAlive => {
-                                    if (this._activePlaySeq !== _navSeq) { this._proxyRetrying = false; return; }
-                                    if (workerAlive) {
-                                        (this._adProxyBadSites = this._adProxyBadSites || {})[failSite] = 1;   // 本会话该线路不再走代理(play() 里会改直连)
-                                        console.log('[播放器] 🛡️ 过滤代理正常、但 ' + failSite + ' 线路过不了代理(源站可能封代理IP)，为保住广告过滤自动换线路');
-                                        try { dp.notice('该线路无法过滤广告，自动换线路…', 2500); } catch (e) { }
-                                        this._proxyRetrying = false;
-                                        this.handlePlaybackError();
-                                        return;
-                                    }
-                                    console.log('[播放器] 🛡️ 代理播放失败(代理不可用/无备选线路)，回退直连:', (fb || '').substring(0, 60));
-                                    try { dp.notice('广告过滤代理暂不可用，本集直连播放（可能含广告）', 3000); } catch (e) { }
-                                    dp.switchVideo({ url: fb, type: 'hls' });
-                                    // 回退后等就绪再播放（switchVideo 不会自动播放）
+                                const health = this._siteHealthGet ? (this._siteHealthGet(failSite) || {}) : {};
+                                const directOK = (this.currentSource && this.currentSource._testType === 'direct') || health._testType === 'direct';
+                                // 切到指定 URL 播放 + 3s 看门狗(仍起不来才切下一个源)。reason 仅日志用。
+                                const switchTo = (url, reason) => {
+                                    console.log('[播放器] 🛡️ ' + reason + ':', (url || '').substring(0, 70));
+                                    this._dpSwitchHls(url);
                                     const onMeta = () => {
                                         dp.video.removeEventListener('loadedmetadata', onMeta);
                                         const p = dp.play();
@@ -9507,17 +9734,79 @@
                                     };
                                     if (dp.video && dp.video.readyState >= 1) onMeta();
                                     else if (dp.video) dp.video.addEventListener('loadedmetadata', onMeta);
-                                    // 3秒后解除锁定（足够 switchVideo 完成加载）；若回退直连后仍未起播
-                                    //（代理 403 + 直连 CORS/拒连都失败，此时不会再触发 error 事件 → 原先会永久卡黑屏）→ 自动切下一个源
                                     setTimeout(() => {
                                         this._proxyRetrying = false;
-                                        if (this._activePlaySeq === _navSeq && dp && dp.video &&
-                                            dp.video.readyState < 3 && (dp.video.currentTime || 0) === 0) {
-                                            console.log('[播放器] 代理+直连均失败，自动切换下一个源');
+                                        // 🎟️ 必须用播放令牌判边界(不能用 playSeq/_navSeq——同一部剧内切源它们不变):
+                                        //    否则本源装的看门狗会在切源后对【新源】的 video 做判定,新源只要 8s 内没到
+                                        //    readyState 3 就被判死并再切一个 → 每个源给下一个源判死刑 = 级联切源风暴,
+                                        //    一圈下来"所有资源站都播不了"(生产实测:日志反复刷"回退后仍未起播"直到源用尽)。
+                                        if (this._playToken !== playToken) return;   // 已切源/换集 → 本看门狗作废
+                                        if (dp && dp.video && dp.video.readyState < 3 && (dp.video.currentTime || 0) === 0) {
+                                            console.log('[播放器] 回退后仍未起播，自动切换下一个源');
                                             this.handlePlaybackError();
                                         }
-                                    }, 3000);
-                                });
+                                    }, 8000);   // 3s→8s:海外用户拉国内 CDN,首个分片常要 4~6s,3s 必然误判"起不来"
+                                };
+                                // 通过 worker 重取本集 m3u8,分类 worker故障 / 源站封CF / 偶发
+                                (async () => {
+                                  try {
+                                    let cls = 'workerdown';   // 默认按"临时故障"处理(最保守:不记账)
+                                    try {
+                                        const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
+                                        const pr = await fetch(wrapped, { cache: 'no-store', signal: ctl.signal });
+                                        clearTimeout(t);
+                                        if (pr.status >= 500 || pr.status === 429) cls = 'workerdown';
+                                        else if (pr.status === 403 || pr.status === 404 || pr.status === 451) cls = 'siteblock';
+                                        else if (pr.ok) { let txt = ''; try { txt = await pr.text(); } catch (e) { } cls = /#EXTM3U/.test(txt) ? 'ok' : 'siteblock'; }
+                                        else cls = 'siteblock';
+                                    } catch (e) { cls = 'workerdown'; }   // 超时/网络失败 = worker 侧不可达 → 临时故障
+                                    if (this._activePlaySeq !== _navSeq || this._playToken !== playToken) { this._proxyRetrying = false; return; }
+                                    if (cls === 'ok') {
+                                        console.log('[播放器] 🛡️ 过滤代理探测正常(worker+源站均通)，原错误疑似偶发，重试过滤播放');
+                                        switchTo(wrapped, '重试广告过滤代理');
+                                        return;
+                                    }
+                                    if (cls === 'workerdown') {
+                                        // 主过滤代理临时故障 → 先试配置的【备用 worker】(多代理冗余:CORS_PROXY_URL 逗号分隔多个),
+                                        //   备用能通就把本会话主代理轮换过去(后续集/直播都用它),都不通才直连兜底。
+                                        //   注:源站封 CF(siteblock)不会走到这里——那种换个 CF worker 也一样被封,只有 worker 自身故障才轮换有意义。
+                                        const others = (this.corsProxyUrls || []).filter(p => p && p !== this.corsProxyUrl);
+                                        let backup = null;
+                                        for (const p of others) {
+                                            try {
+                                                const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
+                                                const pr = await fetch(p + '/?url=' + encodeURIComponent(fb), { cache: 'no-store', signal: ctl.signal });
+                                                clearTimeout(t);
+                                                if (pr.ok) { let tx = ''; try { tx = await pr.text(); } catch (e) { } if (/#EXTM3U/.test(tx)) { backup = p; break; } }
+                                            } catch (e) { }
+                                        }
+                                        if (this._activePlaySeq !== _navSeq || this._playToken !== playToken) { this._proxyRetrying = false; return; }
+                                        if (backup) {
+                                            this.corsProxyUrl = backup;   // 本会话主代理轮换到健康备用
+                                            console.log('[播放器] 🛡️ 主过滤代理临时故障，已切换到备用过滤代理:', backup);
+                                            try { dp.notice('已切换到备用广告过滤线路', 2500); } catch (e) { }
+                                            switchTo(backup + '/?url=' + encodeURIComponent(fb), '切备用过滤代理');
+                                            return;
+                                        }
+                                        console.log('[播放器] 🛡️ 过滤代理(worker)暂时不可用(5xx/超时)' + (others.length ? '，备用代理也不通' : '') + '，本集直连播放，不记账，下次自动重试过滤');
+                                        try { dp.notice('广告过滤暂时波动，本集直连播放，稍后自动恢复', 3000); } catch (e) { }
+                                        switchTo(fb, '过滤代理临时故障→直连兜底');
+                                        return;
+                                    }
+                                    // siteblock:源站封 CF —— 记账
+                                    this._adProxyBadMark(failSite);
+                                    if (directOK) {
+                                        console.log('[播放器] 🛡️ ' + failSite + ' 源站屏蔽过滤代理(worker→403/404)，原站直连，12h 内不再走代理');
+                                        try { dp.notice('该线路屏蔽了广告过滤，已直连播放（可能含广告）', 3000); } catch (e) { }
+                                        switchTo(fb, '源站屏蔽过滤代理→直连');
+                                    } else {
+                                        console.log('[播放器] 🛡️ ' + failSite + ' 源站封过滤代理且非直连可达，换线路保过滤');
+                                        try { dp.notice('该线路无法过滤广告，自动换线路…', 2500); } catch (e) { }
+                                        this._proxyRetrying = false;
+                                        this.handlePlaybackError();
+                                    }
+                                  } catch (e) { this._proxyRetrying = false; console.warn('[播放器] 代理分诊异常,已解闸:', e && e.message); }
+                                })();
                                 return;
                             }
                             this.handlePlaybackError();
@@ -9552,7 +9841,7 @@
                             volume: 0.8,             // 默认音量 80%
                             loop: false,             // 循环播放（可在设置中切换）
                             playbackSpeed: [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 3],  // 0.25间隔倍速选项
-                            video: { url: finalUrl, type: 'hls' },
+                            video: { url: finalUrl, type: 'hls', customType: { hls: window._dgHlsCustomType } },   // 🎯 MSE 可用即强制 hls.js(见 _dgHlsCustomType)
                             pluginOptions: { hls: buildOfflineHlsConfig() },  // ⬇️ 离线缓存优先的 hls loader(无缓存时行为与原生一致)
                             danmaku: danmakuOpt || undefined,  // 🗨️ 弹幕(借第三方聚合)；未开启则 undefined(DPlayer 不初始化弹幕)
                             contextmenu: [
@@ -10236,6 +10525,19 @@
                                         if (segs.some(s => s.key === 'unsupported')) throw new Error('不支持的加密(非AES-128)');
                                         const ac = this._ac || (this._ac = new (window.AudioContext || window.webkitAudioContext)());
                                         for (const s of segs) {
+                                            // 🚦 逐段让路:播放器一旦卡顿/换源就立刻停抓(分析永远让位于播放)。
+                                            //   缓冲低于 6s 视为"播放正在挨饿",此时再抢带宽必然把播放拖死。
+                                            if (this._abort) throw new Error('播放需要带宽,分析已让路');
+                                            try {
+                                                const v = (typeof dp !== 'undefined' && dp && dp.video) ? dp.video : null;
+                                                if (v && !v.paused) {
+                                                    let ahead = 0;
+                                                    for (let bi = 0; bi < v.buffered.length; bi++) {
+                                                        if (v.currentTime >= v.buffered.start(bi) - 0.5 && v.currentTime <= v.buffered.end(bi) + 0.5) { ahead = v.buffered.end(bi) - v.currentTime; break; }
+                                                    }
+                                                    if (v.readyState < 3 || ahead < 6) throw new Error('播放缓冲不足,分析让路');
+                                                }
+                                            } catch (e) { if (/让路/.test(e.message)) throw e; }
                                             const buf0 = await (await F(s.url)).arrayBuffer(); this._mb += buf0.byteLength / 1048576;
                                             const buf = s.key ? await this._decrypt(buf0, s.key, F, sess.keyCache) : buf0;
                                             const { type, data, pts, vpts } = this._tsToAdts(new Uint8Array(buf));
@@ -10630,11 +10932,28 @@
                                         try { const c = navigator.connection; if (c && (c.saveData || /(^|\b)2g/.test(c.effectiveType || '') || c.type === 'cellular')) { if (!this._netLogged) { this._netLogged = true; console.log('[AFP离线] 省流量模式/蜂窝网络,不自动离线分析(已有共享标记仍正常使用)'); } return; } } catch (e) { }
                                         if (st.mb > 700) { console.log('[AFP离线] 《' + o.title + '》本线路分析已用 ' + st.mb.toFixed(0) + 'MB,超过单剧上限,不再自动分析(已学到的标记仍正常使用;换线路/等下次访问会重试)'); return; }
                                         if (this._mb > 2000) { console.log('[AFP离线] 本次会话分析总流量已达 ' + this._mb.toFixed(0) + 'MB 上限,本次不再自动分析(刷新页面重置)'); return; }
+                                        // ⏳ 必须等播放【真正稳住】才开抓——分析要下几十~上百 MB 分片,和播放器抢的是同一份带宽。
+                                        //   生产事故(2026-08):海外用户拉国内 CDN 本就吃紧,起播瞬间分析就开抓(旧版只固定等 4s),
+                                        //   直接把播放器的分片请求挤死 → 报错 → 切源 → 新源 canplay 又启动一轮分析 → 恶性循环,
+                                        //   表现为"所有资源站都播不了"(日志实证:定位一集就吃掉 163MB,还要再抓两集尾部各 4 分钟)。
+                                        //   规则:视频必须处于 已播>10s 且 readyState≥3 且 未暂停 才认为稳;60s 等不到就本次放弃(播放优先)。
+                                        const myToken = o.vue._playToken;
+                                        let stable = false;
+                                        for (let i = 0; i < 60; i++) {
+                                            await new Promise(r => setTimeout(r, 1000));
+                                            if (o.vue._playToken !== myToken) return;   // 换集/换源/换剧 → 本次分析作废(别对新源乱抓)
+                                            try {
+                                                const v = (typeof dp !== 'undefined' && dp && dp.video) ? dp.video : null;
+                                                if (v && !v.paused && v.readyState >= 3 && (v.currentTime || 0) > 10) { stable = true; break; }
+                                            } catch (e) { }
+                                        }
+                                        if (!stable) { if (!this._unstableLogged) { this._unstableLogged = true; console.log('[AFP离线] 播放未稳定(卡顿/暂停/已切源),本次不分析——优先保证播放'); } return; }
+                                        if (this._busy || st.phase === 'pending') return;   // 等待期间可能已有别的分析开跑
                                         this._busy = true; const back = st.phase; st.phase = 'pending';
+                                        this._abort = false; this._token = myToken;
                                         const mbBefore = this._mb;
                                         let done = false;
                                         try {
-                                            await new Promise(r => setTimeout(r, 4000));   // 等换源/测速/深链尘埃落定(期间源还在切,当场抓必抓错)
                                             if (o.vue._liveActive || !o.vue.currentSource || o.vue.currentSource.site_key !== o.site || o.vue._introEpNum() !== o.ep) return;
                                             const F = this._mkFetch(o.vue), curUrl = o.vue.currentUrl;
                                             let saved = st.intro || (st.intro = this._envTag(this._envLoadAny(o)));
@@ -11787,28 +12106,10 @@
                         //    安全时序——先捕获旧实例，switchVideo 创建新实例后，等"新流真正 playing"
                         //    再销毁旧的：此时 <video> 已挂上可用的新源，detach 旧实例不会触发"无源"报错，
                         //    从而既回收泄漏又不会误跳过线路（旧实现是在 switchVideo 前 destroy 才出的问题）。
-                        const _oldHls = (dp.plugins && dp.plugins.hls) || null;
-
                         // 🗨️ 仅"换集"(danmakuReload)时重载弹幕；同集换源/代理回退不传第二参(DPlayer 保留当前弹幕，不闪烁/不重拉)
-                        dp.switchVideo({ url: finalUrl, type: 'hls' }, danmakuReload ? danmakuOpt : undefined);
-                        this._attachHlsErrorHook();   // 🔌 switchVideo 会新建 hls 实例,错误钩子要重挂(实例级防重)
+                        // 🧹 旧 hls 实例在 switchVideo 后【立即】销毁(见 _dpSwitchHls)——绝不允许两个 hls 实例同时挂在一个 <video> 上
+                        this._dpSwitchHls(finalUrl, danmakuReload ? danmakuOpt : undefined);
                         console.log('[进度记忆-切换] switchVideo 已调用' + (finalUrl !== url ? ' (代理模式)' : ''));
-
-                        if (_oldHls) {
-                            let _destroyed = false;  // 防止 'playing' 与 5s 兜底重复销毁
-                            const destroyOldHls = () => {
-                                if (_destroyed) return;
-                                _destroyed = true;
-                                if (dp.video) dp.video.removeEventListener('playing', destroyOldHls);
-                                // 仅当它确实是被替换掉的旧实例时才销毁，避免误杀当前实例
-                                if (_oldHls !== (dp.plugins && dp.plugins.hls)) {
-                                    try { _oldHls.destroy(); } catch (e) { }
-                                }
-                            };
-                            if (dp.video) dp.video.addEventListener('playing', destroyOldHls);
-                            // 兜底：5秒后无论是否 playing 都回收（仍只在它非当前实例时）
-                            setTimeout(destroyOldHls, 5000);
-                        }
 
                         // ▶ 修复"切换资源/集数后不自动播放 + 中央大按钮图标反向"：
                         //   switchVideo 会复用同一个 <video> 元素但重置 src，HLS 尚未就绪时立刻 dp.play()
@@ -12263,7 +12564,22 @@
                     // 如果还有下一个线路可用，给一段宽限期后再决定是否切换
                     if (currentIndex >= 0 && currentIndex < allSources.length - 1) {
                         this.isAutoRetrying = true;
-                        const nextSource = allSources[currentIndex + 1];
+                        // 🎯 优先切到【确实有当前这一集】的线路,而不是无脑取下一个:
+                        //    无脑顺延会切到没有这一集的源 → parseEpisodes 回退播第一集(先导片/预告/空清单)→ 又失败,
+                        //    一路把线路耗尽,而真正有这一集的好源(生产实测 ikun 有"第20260809期加更"且 1279 分片可播)
+                        //    永远轮不上 —— 这就是用户看到的"所有资源站都播不了"。
+                        //    _sourceHasEpisode 用测速时已缓存的剧集表判断,不发请求;返回 null(详情未缓存)按"可试"处理。
+                        const _curEpName = (this.episodeList || []).find(e => e.url === this.currentUrl)?.name;
+                        let nextSource = null;
+                        for (let i = currentIndex + 1; i < allSources.length; i++) {
+                            if (this._sourceHasEpisode(allSources[i], _curEpName) !== false) { nextSource = allSources[i]; break; }
+                        }
+                        if (!nextSource) {
+                            console.log('[Auto-Failover] 后续线路都没有《' + (_curEpName || '本集') + '》,按原顺序试下一个');
+                            nextSource = allSources[currentIndex + 1];
+                        } else if (nextSource !== allSources[currentIndex + 1]) {
+                            console.log('[Auto-Failover] 跳过不含本集的线路,直接切到有《' + _curEpName + '》的:', nextSource.site_name);
+                        }
                         this.autoRetryMessage = `正在检测 ${failingSource?.site_name} 线路...`;
                         console.log('[Auto-Failover] 收到错误事件，进入 1.5s 宽限期检测是否真的不可播');
 
@@ -12408,11 +12724,46 @@
                 // 🔌 给当前 hls 实例挂网络错误监听(幂等,实例级防重)。DPlayer 首建与 switchVideo 都会换实例,两处都要挂。
                 //    非致命网络错误:断网(onLine=false)攒 1 次、在线抖动攒 3 次(给 hls 自身重试留机会)→ 尝试切缓存;
                 //    致命错误:先尝试切缓存,无缓存可切才交给既有错误处理链(分诊→换线路→离线上下文兜底)。
+                // 🔁 唯一的"切视频"入口:switchVideo → 重挂 hls 错误钩子 → 【立即】销毁被顶掉的旧 hls 实例。
+                //   为什么必须立即销毁而不是"等新流 playing/5s 兜底":旧实例的 MediaSource 在新实例 attach 的一瞬就被顶掉了,
+                //   但它的加载/追加流水线还活着,会继续拉分片往已关闭的 SourceBuffer 里塞 → bufferAppendError 每秒上千条、
+                //   条条"致命" → 全灌进错误处理链 → 把明明播得好好的新源判死再换源(实测 7s 内 3918 条+一次误换源)。
+                //   立即销毁安全吗:hls.js 1.1.5 detach 时只在 `media.src === 自己的 blob` 才 removeAttribute('src')+load(),
+                //   此刻 video.src 已是新实例的 blob → 跳过清理,不会触发"无源"错误(旧版"switchVideo 前 destroy 才误跳线路"
+                //   的坑正是因为那时 src 还是它自己的)。
+                _dpSwitchHls(url, danmakuOpt) {
+                    const oldHls = (typeof dp !== 'undefined' && dp && dp.plugins && dp.plugins.hls) || null;
+                    if (danmakuOpt) dp.switchVideo({ url, type: 'hls' }, danmakuOpt);
+                    else dp.switchVideo({ url, type: 'hls' });
+                    this._attachHlsErrorHook();   // 🔌 switchVideo 会新建 hls 实例,错误钩子要重挂(实例级防重)
+                    if (oldHls && oldHls !== (dp.plugins && dp.plugins.hls)) {
+                        try { oldHls.destroy(); } catch (e) { }
+                    }
+                },
+
                 _attachHlsErrorHook() {
                     try {
                         const h = dp && dp.plugins && dp.plugins.hls;
                         if (!h || h._offErrHooked || !window.Hls || !Hls.Events) return;
                         h._offErrHooked = true;
+                        // 🚨 零分片清单 = 死源(实测:某资源站返回 `#EXTM3U…#EXT-X-ENDLIST` 中间一个 EXTINF 都没有)。
+                        //    这种清单【语法完全合法】,hls.js 既不报错也没内容 → 播放器停在 00:00、点播放毫无反应、
+                        //    console 一片干净,且因为没有 error 事件,自动换源链根本不会触发 → 好线路被白白晾着,
+                        //    用户体验就是"所有资源站都播不了"(生产实测:量子资源空清单,而 ffzy/魔都各有 959/1917 分片可播)。
+                        //    这里补上唯一能识破它的闸:清单解析完直接看分片数,为 0 立刻按"该源不可播"处理。
+                        const onLevel = (evt, data) => {
+                            try {
+                                if (this._activePlaySeq !== _navSeq) return;
+                                const frags = data && data.details && data.details.fragments;
+                                if (frags && frags.length === 0) {
+                                    console.warn('[播放器] ⚠️ 该线路返回空播放列表(0 个分片),视为不可播 → 自动换源');
+                                    try { dp.notice('该线路无有效内容，正在换源', 2500); } catch (e) { }
+                                    if (typeof window._offHandlePlayError === 'function') window._offHandlePlayError('emptyPlaylist');
+                                    else this.handlePlaybackError();
+                                }
+                            } catch (e) { }
+                        };
+                        if (Hls.Events.LEVEL_LOADED) h.on(Hls.Events.LEVEL_LOADED, onLevel);
                         let netErrCount = 0;
                         h.on(Hls.Events.ERROR, (evt, data) => {
                             try {

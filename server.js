@@ -14,6 +14,30 @@ const stream = require('stream');
 const { promisify } = require('util');
 const pipeline = promisify(stream.pipeline);
 
+// ========== 🔌 出网连接池硬限制(全站可用性的保命阀) ==========
+// 事故(2026-08,v1.1.174):Node 默认 globalAgent.maxSockets = Infinity。前端每开一部剧就对 50+ 资源站
+//   并发测速/搜索,曾有一版 /api/check 还会逐站真拉 m3u8——出网连接无上限增长,超时/中止的 socket 未及时
+//   回收,累积撞穿容器 fd 上限(ulimit -n 通常 1024)后【所有新出网请求全部失败】:资源站、TMDB、弹幕、
+//   甚至连自家 Cloudflare Worker 都连不上,而缓存接口照常返回 → 表现为"搜索全 0 / 资源站全灭",极难自诊断。
+//   (泄漏源已删,但进程不重启则已泄漏的 fd 不释放——这正是"播放修好了搜索还坏"的原因。)
+// 修:全局 Agent 显式限流 + keepAlive 复用连接(同一资源站多次请求复用同一条 TCP,fd 占用降一个数量级),
+//   并设 socket 空闲超时,任何路径的泄漏都被 maxSockets 挡在天花板下,永远不会再撞穿 fd 上限。
+const http = require('http');
+const https = require('https');
+const AGENT_OPTS = { keepAlive: true, keepAliveMsecs: 15000, maxSockets: 96, maxFreeSockets: 32, timeout: 30000, scheduling: 'lifo' };
+http.globalAgent = new http.Agent(AGENT_OPTS);
+https.globalAgent = new https.Agent(AGENT_OPTS);
+axios.defaults.httpAgent = http.globalAgent;
+axios.defaults.httpsAgent = https.globalAgent;
+// 🩺 出网健康自检:fd 逼近上限时明确告警(而不是让全站静默变成"搜不到")
+setInterval(() => {
+    try {
+        const n = (https.globalAgent.sockets ? Object.values(https.globalAgent.sockets).reduce((a, b) => a + b.length, 0) : 0)
+            + (http.globalAgent.sockets ? Object.values(http.globalAgent.sockets).reduce((a, b) => a + b.length, 0) : 0);
+        if (n >= AGENT_OPTS.maxSockets * 0.9) console.warn(`[出网告警] 活跃 socket ${n}/${AGENT_OPTS.maxSockets} 接近上限——上游普遍变慢或出网受阻`);
+    } catch (e) { }
+}, 60000).unref();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'db.json');
@@ -64,7 +88,12 @@ function userIdentity(token, label) {
 const REMOTE_DB_URL = process.env['REMOTE_DB_URL'] || '';
 
 // CORS 代理 URL（用于中转无法直接访问的资源站 API）
-const CORS_PROXY_URL = process.env['CORS_PROXY_URL'] || '';
+// 支持配多个(逗号/空格分隔)做冗余:CORS_PROXY_URL=https://cors.a.com,https://cors.b.com
+//   每个都归一化(trim + 去尾部斜杠,拼接时统一 `${u}/?url=`)。CORS_PROXY_URL 取第一个作主代理,
+//   所有历史单代理代码零改动照常用;完整列表经 /api/config 下发前端,前端在过滤代理故障时自动轮换到备用。
+const CORS_PROXY_URLS = (process.env['CORS_PROXY_URL'] || '')
+    .split(/[,\s]+/).map(s => s.trim().replace(/\/+$/, '')).filter(s => /^https?:\/\//i.test(s));
+const CORS_PROXY_URL = CORS_PROXY_URLS[0] || '';
 
 // 📺 直播(IPTV)：上游 M3U 源(vbskycn/iptv，每6h更新)。可用 LIVE_M3U_URL 覆盖主源、LIVE_M3U_FALLBACK 覆盖备源；
 //    设 LIVE_TV_DISABLED=1 整体关闭(前端隐藏直播区、后端 /api/live/channels 返回 enabled:false)。
@@ -98,7 +127,7 @@ const LIVE_VALIDATE = !envFlag('LIVE_NO_VALIDATE');
 console.log(`[System] Environment: ${process.env.VERCEL ? 'Vercel Serverless' : 'Local/VPS'}`);
 console.log(`[System] TMDB_API_KEY: ${process.env.TMDB_API_KEY ? '✓ Configured' : '✗ Missing'}`);
 console.log(`[System] TMDB_PROXY_URL: ${process.env['TMDB_PROXY_URL'] || '(not set)'}`);
-console.log(`[System] CORS_PROXY_URL: ${CORS_PROXY_URL || '(not set)'}`);
+console.log(`[System] CORS_PROXY_URL: ${CORS_PROXY_URL || '(not set)'}${CORS_PROXY_URLS.length > 1 ? ` (+${CORS_PROXY_URLS.length - 1} 备用: ${CORS_PROXY_URLS.slice(1).join(', ')})` : ''}`);
 console.log(`[System] REMOTE_DB_URL: ${REMOTE_DB_URL ? '✓ Configured' : '(not set)'}`);
 console.log(`[System] 直播(IPTV): ${LIVE_TV_ENABLED ? '✓ 启用 (' + LIVE_M3U_URL + ')' : '✗ 已禁用 (LIVE_TV_DISABLED)'}`);
 
@@ -1313,8 +1342,10 @@ app.get('/api/config', (req, res) => {
     res.json({
         tmdb_api_key: process.env.TMDB_API_KEY,
         tmdb_proxy_url: process.env['TMDB_PROXY_URL'],
-        // CORS 代理 URL（用于中转无法直接访问的资源站 API）
+        // CORS 代理 URL（用于中转无法直接访问的资源站 API）。cors_proxy_url=主代理(向后兼容);
+        // cors_proxy_urls=全部代理(前端故障时轮换到备用 worker)
         cors_proxy_url: CORS_PROXY_URL || null,
+        cors_proxy_urls: CORS_PROXY_URLS,
         // Vercel 环境下禁用本地图片缓存，防止写入报错
         enable_local_image_cache: !IS_VERCEL,
         // 多用户同步功能
@@ -2088,7 +2119,26 @@ app.get('/api/check', async (req, res) => {
         if (!site || !site.api) return res.json({ latency: 9999 });
         const start = Date.now();
         try {
-            await axios.get(`${site.api}?ac=list&pg=1`, { timeout: 3000 });
+            // 必须返回【有效 videolist JSON 且有 http 播放地址】才算通——挡掉返回 200 的死站
+            // (域名停放页/Cloudflare 人机校验页/HTML 报错页,它们解析不出 JSON list → 9999)。
+            // ⚠️ 但【绝不在服务器上真拉 m3u8 验证】:VPS 是数据中心 IP,视频 CDN 普遍封机房出口(这正是要建
+            //    CORS worker 的原因)——曾加过"抽样 m3u8 拉一次验 #EXTM3U",结果生产上【所有站】全判 9999
+            //    (可用性检查形同虚设,前端超时死锁下全站不可播,事故)。且抽样的是榜单第一页随机片,住宅网络实测
+            //    健康站也常抽到 403/404 过期链接。真实可播性只能由【客户端】直连/代理测速把关,服务器只管
+            //    "API 活着且返回正经片库"这一层。
+            const UA_HDRS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'application/json' };
+            let list = null;
+            try {
+                const r = await axios.get(`${site.api}?ac=videolist&pg=1`, { timeout: 4000, responseType: 'json', headers: UA_HDRS });
+                list = r.data && Array.isArray(r.data.list) ? r.data.list : null;
+            } catch (e) { }
+            if (!list || !list.length) {
+                // 部分 CMS 变体对 ac=videolist 返回空/不支持 → 退回 ac=detail 再试一次(资源站验活的既定铁律)
+                const r2 = await axios.get(`${site.api}?ac=detail&pg=1`, { timeout: 4000, responseType: 'json', headers: UA_HDRS });
+                list = r2.data && Array.isArray(r2.data.list) ? r2.data.list : null;
+            }
+            if (!list || !list.length) return res.json({ latency: 9999 });
+            if (!list.some(v => /https?:\/\//.test(String(v.vod_play_url || '')))) return res.json({ latency: 9999 });
             return res.json({ latency: Date.now() - start, _testType: 'server' });
         } catch (e) {
             return res.json({ latency: 9999 });
@@ -3337,9 +3387,12 @@ ${urls.join('\n')}
 });
 
 // Helper: Get DB data (Local or Remote)
+// ⚠️ 必须剥 UTF-8 BOM:db.json 若由 PowerShell/记事本保存会带 BOM(EF BB BF),
+//    JSON.parse 直接吃带 BOM 的字符串会抛 "Unexpected token" → getDB 全线抛错被上层 catch 吞掉,
+//    表现为 /api/check 对所有源恒返回 9999(健康检查形同虚设)、POST 搜索拿不到源。剥掉即可。
 function getDB() {
     if (remoteDbCache) return remoteDbCache;
-    return JSON.parse(fs.readFileSync(DATA_FILE));
+    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8').replace(/^\uFEFF/, ''));
 }
 
 // 本地/Docker 环境：启动服务器监听
