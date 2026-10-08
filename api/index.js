@@ -13,6 +13,39 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+// 🎌 Kazumi 规则源(七色番/动漫巴士):与 server.js 共用 lib/kazumi(同一份实现,勿在此另抄一份)。
+//    加载失败只禁用这批源;KAZUMI_DISABLE=1 整体关闭。Serverless 下模块内缓存按实例存活,冷启动会重抓(可接受)。
+let kazumi = null;
+try { kazumi = require('../lib/kazumi'); } catch (e) { console.warn('[Kazumi] 模块加载失败,规则源已禁用:', e.message); }
+const withKzSites = (sites) => {
+    if (!kazumi) return sites || [];
+    const base = sites || [];
+    let kz = [];
+    try { kz = kazumi.getSites(); } catch (e) { console.warn('[Kazumi] getSites 失败,本次只用 maccms 站:', e.message); }
+    const have = new Set(base.map(x => x.key));
+    return base.concat(kz.filter(x => !have.has(x.key)));
+};
+if (kazumi) { try { kazumi.registerRoutes(app); } catch (e) { console.warn('[Kazumi] 路由注册失败:', e.message); } }
+// ✂️ 剪掉插播后的清单托管:无状态函数存不住(POST 与之后的 GET 可能落在不同实例)→ 只挂 501 桩;/api/config 报 hls_cut:false,
+//    前端在 Safari 原生 HLS 上退回"播放中静默跳过"(hls.js 通道在浏览器里剪,不需要服务器)
+try { require('../lib/hls-cut').registerStub(app); } catch (e) { console.warn('[HlsCut] 桩注册失败:', e.message); }
+// 🏷️ 资源站档案(徽章/选源偏好):与 server.js 共用 lib/site-profiles(静态 require,Vercel 才会把 profiles.json 打包)。
+//    加载失败/查询抛错只是不带徽章,绝不影响搜索与播放。
+let siteProfiles = null;
+try { siteProfiles = require('../lib/site-profiles'); } catch (e) { console.warn('[SiteProfiles] 模块加载失败,线路徽章已禁用:', e.message); }
+const profOf = (site) => {
+    if (!siteProfiles) return undefined;   // undefined → JSON 里没有 site_profile 字段,前端回退 /api/sites 的 profiles 表
+    try { return siteProfiles.profileFor(site); } catch (e) { return undefined; }
+};
+// /api/sites 附带 {key: 档案} 表(含内置规则站)。返回新对象,绝不改 EMBEDDED_SITES/remoteDbCache
+const withSiteProfiles = (d) => {
+    if (!siteProfiles || !d || typeof d !== 'object') return d;
+    try {
+        const base = Array.isArray(d.sites) ? d.sites : [];
+        return Object.assign({}, d, { profiles: siteProfiles.profileMap(withKzSites(base)), profiles_version: siteProfiles.version });
+    } catch (e) { console.warn('[SiteProfiles] profileMap 失败,本次不带徽章:', e.message); return d; }
+};
+
 // ========== 环境变量 ==========
 const REMOTE_DB_URL = process.env['REMOTE_DB_URL'] || '';
 const TMDB_API_KEY = process.env.TMDB_API_KEY || ''; // Keep Required
@@ -145,38 +178,67 @@ async function isChineseIP(req) {
 
 // ========== API: /api/sites ==========
 app.get('/api/sites', async (req, res) => {
+    // 所有出口统一走 send:附带档案表(空站点也带内置规则站的档案)
+    const send = (d) => res.json(withSiteProfiles(d));
     try {
         // 优先使用嵌入的站点配置（不过期）
         if (EMBEDDED_SITES) {
-            return res.json(EMBEDDED_SITES);
+            return send(EMBEDDED_SITES);
         }
 
         // 使用远程配置（带缓存）
         const now = Date.now();
         if (remoteDbCache && now - remoteDbLastFetch < REMOTE_DB_CACHE_TTL) {
-            return res.json(remoteDbCache);
+            return send(remoteDbCache);
         }
         if (REMOTE_DB_URL) {
             const response = await axios.get(REMOTE_DB_URL, { timeout: 5000 });
             if (response.data && Array.isArray(response.data.sites)) {
                 remoteDbCache = response.data;
                 remoteDbLastFetch = now;
-                return res.json(remoteDbCache);
+                return send(remoteDbCache);
             }
         }
         // Vercel 环境下没有本地 db.json，返回空
-        return res.json({ sites: [] });
+        return send({ sites: [] });
     } catch (err) {
         console.error('[Remote DB Error]', err.message);
-        return res.json({ sites: [] });
+        return send({ sites: [] });
     }
 });
 
 // ========== API: /api/check ==========
 // 服务器端测速兜底：客户端直连+代理都失败时(混合内容/CORS)由服务器测资源站 API 延迟。
 // 注：此接口在早期重构中丢失，前端一直调用导致 404 → 服务器测速这条兜底失效，已恢复。
+// 🗄️ 内存缓存 + 同站并发合并(同 server.js;serverless 实例内 best-effort):通的 5 分钟、不通的 90 秒;
+//    上游【超时】得出的 9999 带 transient:true 且不缓存,前端据此不写 12h 死亡缓存。
+const checkCache = new Map();      // key -> { data, expiry }
+const checkInflight = new Map();   // key -> Promise<data>
+const CHECK_OK_TTL = 5 * 60 * 1000, CHECK_FAIL_TTL = 90 * 1000, CHECK_CACHE_MAX = 1000;
+const isTimeoutErr = (e) => !!e && (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT' || /timeout/i.test(String(e.message || '')));
 app.get('/api/check', async (req, res) => {
-    const { key } = req.query;
+    const key = String(req.query.key || '');
+    // 「刷新线路」带 nocache=1:跳过读缓存强制真测(结果照样写回、照样并发合并)
+    const hit = req.query.nocache === '1' ? null : checkCache.get(key);
+    // 缓存里的失败只当【瞬态】发给别的用户:一次上游抖动(502/连接重置)不能经 90s 缓存扩散成每个人本地 12h 的死亡记录;
+    //   只有亲自跑了这次探测的那个请求拿到非 transient 的失败
+    if (hit && hit.expiry > Date.now()) return res.json(hit.data.latency >= 9000 ? Object.assign({}, hit.data, { transient: true }) : hit.data);
+    let p = checkInflight.get(key);
+    const mine = !p;   // 这次请求亲自跑探测;并发合并进来的请求拿到失败时一律按瞬态(同缓存命中的规则)
+    if (!p) {
+        p = runSiteCheck(key).then((data) => {
+            if (!data.transient) {
+                if (checkCache.size >= CHECK_CACHE_MAX) checkCache.delete(checkCache.keys().next().value);
+                checkCache.set(key, { data, expiry: Date.now() + (data.latency < 9000 ? CHECK_OK_TTL : CHECK_FAIL_TTL) });
+            }
+            return data;
+        }).catch(() => ({ latency: 9999, transient: true })).finally(() => checkInflight.delete(key));
+        checkInflight.set(key, p);
+    }
+    const d = await p;
+    res.json(!mine && d.latency >= 9000 && !d.transient ? Object.assign({}, d, { transient: true }) : d);
+});
+async function runSiteCheck(key) {
     try {
         let sitesData = EMBEDDED_SITES;
         if (!sitesData) {
@@ -192,20 +254,21 @@ app.get('/api/check', async (req, res) => {
                 }
             }
         }
-        const sites = (sitesData && sitesData.sites) || [];
+        const sites = withKzSites((sitesData && sitesData.sites) || []);
         const site = sites.find(s => s.key === key);
-        if (!site || !site.api) return res.json({ latency: 9999 });
+        if (site && kazumi && kazumi.isKzSite(site)) return await kazumi.check(site.key);   // 🎌 只测首页可达,不拉媒体
+        if (!site || !site.api) return { latency: 9999 };
         const start = Date.now();
         try {
             await axios.get(`${site.api}?ac=list&pg=1`, { timeout: 3000 });
-            return res.json({ latency: Date.now() - start, _testType: 'server' });
+            return { latency: Date.now() - start, _testType: 'server' };
         } catch (e) {
-            return res.json({ latency: 9999 });
+            return isTimeoutErr(e) ? { latency: 9999, transient: true } : { latency: 9999 };
         }
     } catch (e) {
-        return res.json({ latency: 9999 });
+        return { latency: 9999, transient: true };
     }
-});
+}
 
 // ========== API: /api/preview ==========
 // 🔗 分享深链预览：未登录用户打开 /?play=剧名 时，前端用本接口拿 TMDB 简介+海报渲染"锁定框架"
@@ -724,7 +787,8 @@ app.get('/api/config', (req, res) => {
         multi_user_mode: ACCESS_PASSWORDS.length > 1,
         danmaku_enabled: !!process.env.DANMU_API_URL,  // 🗨️ 弹幕开关
         // 📮 求片：Vercel 无持久 SQLite、不适合求片(需站长长期履行)→ 始终关闭，仅 VPS(server.js) 支持
-        requests_enabled: false
+        requests_enabled: false,
+        hls_cut: false   // ✂️ 无状态后端托管不了剪后的清单(见 lib/hls-cut)
     });
 });
 
@@ -896,6 +960,8 @@ app.get('/api/search', async (req, res) => {
     } catch (err) {
         console.error('[Search] Failed to load sites:', err.message);
     }
+    sites = withKzSites(sites);   // 🎌 内置规则站
+    const originalTitle = req.query.original || '';
 
     if (sites.length === 0) {
         // 即使没有站点也要返回 SSE 格式，否则 EventSource 会报错
@@ -916,6 +982,14 @@ app.get('/api/search', async (req, res) => {
 
         const allResults = [];
         const searchPromises = targetSites.map(async (site) => {
+            const site_profile = profOf(site);   // 🏷️ 发出时附加(与 server.js 同)
+            if (kazumi && kazumi.isKzSite(site)) {
+                try {
+                    const r = await kazumi.search(site.key, keyword, originalTitle);
+                    ((r && r.list) || []).forEach(item => allResults.push({ ...item, site_key: site.key, site_name: site.name, site_profile }));
+                } catch (err) { console.error(`[Search JSON] ${site.name}:`, err.message); }
+                return;
+            }
             try {
                 const response = await axios.get(site.api, {
                     params: { ac: 'detail', wd: keyword },
@@ -928,9 +1002,11 @@ app.get('/api/search', async (req, res) => {
                             vod_id: item.vod_id,
                             vod_name: item.vod_name,
                             vod_pic: item.vod_pic,
+                            vod_year: item.vod_year,
                             vod_play_url: item.vod_play_url,
                             site_key: site.key,
-                            site_name: site.name
+                            site_name: site.name,
+                            site_profile
                         });
                     });
                 }
@@ -949,6 +1025,15 @@ app.get('/api/search', async (req, res) => {
     res.setHeader('X-Accel-Buffering', 'no');
 
     const searchPromises = sites.map(async (site) => {
+        const site_profile = profOf(site);   // 🏷️ 发出时附加(与 server.js 同)
+        if (kazumi && kazumi.isKzSite(site)) {   // 🎌 规则站:核心关键词 + 0 结果才回退一次(模块内实现)
+            try {
+                const r = await kazumi.search(site.key, keyword, originalTitle);
+                const list = ((r && r.list) || []).map(item => ({ ...item, site_key: site.key, site_name: site.name, site_profile }));
+                if (list.length > 0) res.write(`data: ${JSON.stringify(list)}\n\n`);
+                return list;
+            } catch (err) { console.error(`[Search Error] ${site.name}:`, err.message); return []; }
+        }
         try {
             const response = await axios.get(site.api, {
                 params: { ac: 'detail', wd: keyword },
@@ -967,7 +1052,8 @@ app.get('/api/search', async (req, res) => {
                 vod_play_from: item.vod_play_from,
                 vod_play_url: item.vod_play_url,
                 site_key: site.key,
-                site_name: site.name
+                site_name: site.name,
+                site_profile
             })) : [];
 
             if (list.length > 0) {
@@ -1014,9 +1100,17 @@ app.get('/api/detail', async (req, res) => {
         console.error('[Detail] Failed to load sites:', err.message);
     }
 
+    sites = withKzSites(sites);
     const site = sites.find(s => s.key === siteKey);
     if (!site) {
         return res.status(404).json({ error: 'Site not found' });
+    }
+    if (kazumi && kazumi.isKzSite(site)) {
+        try {
+            const r = await kazumi.detail(site.key, id, { fresh: req.query.nocache === '1' });
+            if (r && r.list && r.list.length) return res.json({ list: [r.list[0]] });
+            return res.status(404).json({ error: 'Not found', list: [] });
+        } catch (err) { console.error('[Detail Error]', err.message); return res.status(500).json({ error: 'Detail fetch failed', list: [] }); }
     }
 
     try {
