@@ -57,6 +57,38 @@
         })();
     </script>
 
+    <!-- 📱 iOS 状态栏兜底:页面盖住了整屏高(画进了状态栏那一行)时,把状态栏高度写到 html 的 --dg-sb-guard,贴顶的按钮(.close-btn)据此往下让。
+         正常情况下 env(safe-area-inset-top) 已经报了这个高度;这里只防"画进去了、env() 却是 0"的情况(请求桌面网站 / 各版本 iOS 的怪行为)。
+         只认 iOS(桌面网站模式 UA 是 Macintosh,靠触点数认),只写 CSS 变量不碰 Vue 状态 -->
+    <script>
+        (function () {
+            try {
+                var ua = navigator.userAgent || '';
+                if (!(/iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1))) return;
+                var last = -1, raf = 0;
+                function update() {
+                    raf = 0;
+                    var sw = screen.width || 0, sh = screen.height || 0, longSide = Math.max(sw, sh), shortSide = Math.min(sw, sh);
+                    if (!longSide) return;
+                    var portrait = window.innerWidth <= window.innerHeight;
+                    var phone = shortSide < 600;
+                    // iOS 的 screen.width/height 不随转屏变;iPhone(刘海 / 灵动岛)横屏不显示状态栏
+                    var full = portrait ? longSide : shortSide;
+                    var covers = (portrait || !phone) && window.innerHeight >= full - 2;
+                    var g = covers ? (phone ? 54 : 24) : 0;
+                    if (g === last) return;
+                    last = g;
+                    document.documentElement.style.setProperty('--dg-sb-guard', g + 'px');
+                }
+                function schedule() { if (!raf) raf = requestAnimationFrame(update); }
+                update();
+                window.addEventListener('resize', schedule, { passive: true });
+                window.addEventListener('orientationchange', function () { setTimeout(update, 300); }, { passive: true });
+                window.addEventListener('pageshow', schedule, { passive: true });
+            } catch (e) { }
+        })();
+    </script>
+
 
     <!-- 性能优化：DNS 预解析和预连接 -->
     <link rel="dns-prefetch" href="//api.themoviedb.org">
@@ -403,6 +435,11 @@
             bottom: auto !important;
             font-size: var(--dm-fontsize, 22px) !important;
             font-family: var(--dm-fontfamily, inherit) !important;
+        }
+        /* 🗨️ 不显示 DPlayer 的"弹幕加载中":它在画面正中间、带 5 秒一抖的动画,慢平台(优酷)一等几十秒,一直挡着画面(用户反馈)。
+           弹幕在后台抓,到了直接飘;最后是空的会在左上角提示一句原因(见 dmEmptyNotice)。 */
+        #dplayer .dplayer-danloading {
+            display: none !important;
         }
         /* 字体选择子列表(点"字体"行展开，每项用各自字体显示) */
         #dplayer .dm-font-list {
@@ -3308,11 +3345,31 @@
             transform: rotate(90deg);
         }
 
+        /* 📱 iOS 状态栏:主屏 App(black-translucent + viewport-fit=cover)这类页面从屏幕最顶上画起的环境里,top:25px 正好落在
+           状态栏 / 灵动岛那一行 —— 那一行的点按被 iOS 拿去做"回到顶部",按钮看得见却点不到。往下让开 safe-area;
+           --dg-sb-guard 是页头脚本量出的兜底(页面盖住了整屏高、env() 却报 0 时)。安卓 / 桌面 / 普通 Safari 竖屏 env() 和兜底都是 0,
+           max() 取回原来的 25px / 30px,样式不变。包在 @supports 里:不认 max() 的老 TV WebView 遇到带 var() 的声明不会回退到上面那条,
+           而是算成 top:auto,按钮会跑位 */
+        @supports (top: max(1px, 2px)) {
+            .close-btn {
+                top: max(25px, calc(env(safe-area-inset-top, 0px) + 12px), calc(var(--dg-sb-guard, 0px) + 12px));
+                right: max(30px, calc(env(safe-area-inset-right, 0px) + 12px));
+            }
+        }
+
         /* 布局容器 */
         .player-layout {
             max-width: 1200px;
             margin: 0 auto;
             padding: 90px 4% 50px;
+        }
+
+        /* 📱 关闭按钮让开状态栏后,标题区跟着让同样多(原来 90px = 按钮底 69px + 21px 间隔),否则长片名第一行钻到按钮底下。
+           env() 和兜底都是 0 时 max() 取回 90px。必须写在上面那条 padding 简写之后 */
+        @supports (top: max(1px, 2px)) {
+            .player-layout {
+                padding-top: max(90px, calc(env(safe-area-inset-top, 0px) + 66px), calc(var(--dg-sb-guard, 0px) + 66px));
+            }
         }
 
         /* 视频区域 */
@@ -7087,6 +7144,13 @@
         // 日期式集名(综艺按播出日期命名):要等视频时长才请求弹幕(见 _dmBackend.read)。须覆盖服务器 danmakuMarkers 认作日期的所有写法
         //   (scripts/danmaku-match-test.mjs 用真实集名校验);多认几个只是晚一两秒发请求,不碍事。
         const _dmDatedRe = /(?:^|\D)(?:19|20)\d{6}(?!\d)|\d{4}\s*[-./年]\s*\d{1,2}|(?:^|\D)\d{6}(?!\d)|(?:^|\D)\d{4}\s*期|\d{1,2}\s*月\s*\d{1,2}/;
+        // 🗨️ 这一集弹幕最后是空的:左上角说一声为什么(以前"弹幕加载中"一闪就没了,看不出是没有还是没取到)。关着弹幕时不说
+        const dmEmptyNotice = (why) => {
+            try {
+                if (typeof dp === 'undefined' || !dp || !dp.danmaku || !dp.danmaku.showing || typeof dp.notice !== 'function') return;
+                dp.notice(why === 'fail' ? '弹幕源暂时没响应，稍后重开本集再试' : why === 'busy' ? '弹幕服务繁忙，稍后重开本集再试' : '本集暂无弹幕', 3000);
+            } catch (e) { }
+        };
         const _dmBackend = {
             want: null,
             seq: 0,       // 每次 read 递增,只有最新的那次可以在等时长
@@ -7097,7 +7161,7 @@
             read(o) {
                 const m = /[?&]id=([^&]*)/.exec(o.url || '');
                 const id = m ? m[1] : '';
-                const seq = ++_dmBackend.seq;
+                const seq = ++_dmBackend.seq, born = Date.now();
                 // 已换剧/换集/进直播(want 变了),或之后又重载过弹幕(有更新的一次 read)→ 晚到的旧弹幕不要
                 const stale = () => id !== _dmBackend.want || seq !== _dmBackend.seq;
                 const go = url => fetch(url, { credentials: 'same-origin' })
@@ -7105,11 +7169,16 @@
                     .then(d => {
                         if (stale()) return;
                         if (d && d.code === 0) {
+                            const list = d.data || [];
+                            // ⏳ 服务器还在抓(优酷等慢平台一集现抓 20~40 秒,端点前台最多等 45 秒,到点回 pending):两秒后再要一次 ——
+                            //    服务器那边这一集的抓取接着在跑,再要会合并进去,不重复回源。最多等 3 分钟,等不到按"弹幕源没响应"
+                            if (d.pending && !list.length && Date.now() - born < 180e3) { setTimeout(() => { if (!stale()) go(url); }, 2000); return; }
                             _dmBackend.src = { id, v: dmAutoSrcOf(d) };
-                            if (o.success) o.success((d.data || []).map(e => ({ time: e[0], type: e[1], color: e[2], author: e[3], text: e[4] })));
+                            if (o.success) o.success(list.map(e => ({ time: e[0], type: e[1], color: e[2], author: e[3], text: e[4] })));
                             // 列表晚到时 DPlayer 的读指针还在 0:下一帧会把"弹幕时间之前"的弹幕一口气全画出来(实测开海量一帧 8 秒)→ 对到当前弹幕时间(见 dmAlignAfterLoad)
                             try { if (typeof dp !== 'undefined') dmAlignAfterLoad(dp); } catch (e) { }
                             try { dmAuto.wake(); } catch (e) { }   // 列表比等待期还晚到:再看一眼要不要自动校正
+                            if (!list.length) dmEmptyNotice(d.pending ? 'fail' : d.why);
                         }
                         else if (o.error) o.error(d && d.msg);
                     })
